@@ -1,15 +1,17 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Card, Typography, App } from 'antd';
 import { feishuApi } from '../utils/feishuApi';
 import { openUrl} from '@tauri-apps/plugin-opener'
 import { start, cancel, onUrl } from '@fabianlars/tauri-plugin-oauth';
 import { emit } from '@tauri-apps/api/event';
+import { loadFeishuConfig } from '../utils/feishuConfig';
+import { buildFeishuAuthorizeUrl } from '../utils/feishuAuth';
+import { UserInfo } from '../types';
 
 
 
 const { Title, Paragraph } = Typography;
 
-const FEISHU_APP_ID = 'cli_a1ad86f33c38500d';
 const FEISHU_SCOPE = 'docs:doc docs:document.media:download docs:document:export docx:document drive:drive drive:file drive:file:download offline_access';
 // const FEISHU_REDIRECT_URI = 'http://localhost:{}/callback';
 
@@ -22,7 +24,26 @@ let globalQRInitialized = false;
 interface AuthData {
   access_token: string;
   refresh_token: string;
-  user_info: any;
+  user_info: UserInfo;
+}
+
+interface QRLoginInstance {
+  matchOrigin(origin: string): boolean;
+  matchData(data: unknown): boolean;
+}
+
+interface QRLoginOptions {
+  id: string;
+  goto: string;
+  width: string;
+  height: string;
+  style: string;
+}
+
+interface AuthWindow extends Window {
+  QRLogin?: (options: QRLoginOptions) => QRLoginInstance;
+  attachEvent?: (type: 'onmessage', listener: (event: MessageEvent) => void) => void;
+  detachEvent?: (type: 'onmessage', listener: (event: MessageEvent) => void) => void;
 }
 
 /**
@@ -38,7 +59,15 @@ interface AuthPageProps {
  */
 const AuthPage: React.FC<AuthPageProps> = ({ onGoToSettings }) => {
   const { message } = App.useApp();
+  const authWindow = window as AuthWindow;
   const [scriptLoaded, setScriptLoaded] = useState(false);
+  const [authConfig] = useState(() => loadFeishuConfig());
+  useEffect(() => {
+    if (!authConfig) {
+      setScriptLoaded(true);
+      message.error('请先在设置页填写完整的飞书应用配置');
+    }
+  }, [authConfig, message]);
   const qrContainerRef = useRef<HTMLDivElement>(null);
   const messageHandlerRef = useRef<((event: MessageEvent) => void) | null>(null);
   const qrInitializedRef = useRef<boolean>(false);
@@ -49,7 +78,7 @@ const AuthPage: React.FC<AuthPageProps> = ({ onGoToSettings }) => {
   /**
    * 处理授权回调
    */
-  const handleAuthCallback = async (code: string) => {
+  const handleAuthCallback = useCallback(async (code: string) => {
     // 防止重复处理授权
     if (isProcessingAuth.current) {
       console.log('授权正在处理中，忽略重复调用');
@@ -69,7 +98,7 @@ const AuthPage: React.FC<AuthPageProps> = ({ onGoToSettings }) => {
       const authData: AuthData = {
         access_token: tokenData.access_token,
         refresh_token: tokenData.refresh_token,
-        user_info: user_info || {}
+        user_info
       };
       
       // 保存认证数据到本地存储
@@ -86,11 +115,15 @@ const AuthPage: React.FC<AuthPageProps> = ({ onGoToSettings }) => {
       // 授权失败时重置标记，允许重试
       isProcessingAuth.current = false;
     }
-  };
+  }, [message]);
 
 
   //启动回调服务器
   useEffect(() => {
+    if (!authConfig) {
+      return;
+    }
+
     const run = async () => {
       const oauthConfig = {
         ports: [3000, 3001],
@@ -131,12 +164,16 @@ const AuthPage: React.FC<AuthPageProps> = ({ onGoToSettings }) => {
       // 重置授权处理标记
       isProcessingAuth.current = false;
     }
-  }, []);
+  }, [authConfig]);
   
   /**
    * 监听URL变化，检测授权回调
    */
   useEffect(() => {
+    if (!authConfig) {
+      return;
+    }
+
     let unlistenRef: (() => void) | null = null;
     
     const checkAuthCallback = (url: string) => {
@@ -181,13 +218,17 @@ const AuthPage: React.FC<AuthPageProps> = ({ onGoToSettings }) => {
         unlistenRef = null;
       }
     };
-  }, []);
+  }, [authConfig, handleAuthCallback]);
 
   /**
    * 加载飞书QR登录脚本
    */
   useEffect(() => {
     // 检查是否已插入 script，避免多次插入
+    if (!authConfig) {
+      return;
+    }
+
     if (!document.getElementById('feishu-qr-script')) {
       const script = document.createElement('script');
       script.id = 'feishu-qr-script';
@@ -204,13 +245,13 @@ const AuthPage: React.FC<AuthPageProps> = ({ onGoToSettings }) => {
     } else {
       setScriptLoaded(true);
     }
-  }, []);
+  }, [authConfig, message]);
 
   /**
    * 初始化飞书QR登录（只执行一次）
    */
   useEffect(() => {
-    if (!scriptLoaded || !qrContainerRef.current || qrInitializedRef.current || globalQRInitialized) return;
+    if (!authConfig || !scriptLoaded || !qrContainerRef.current || qrInitializedRef.current || globalQRInitialized) return;
 
     // 双重检查，防止React严格模式导致的重复执行
     if (qrInitializedRef.current || globalQRInitialized) return;
@@ -218,10 +259,11 @@ const AuthPage: React.FC<AuthPageProps> = ({ onGoToSettings }) => {
     globalQRInitialized = true;
 
     const containerId = 'feishu-qr-container';
-    qrContainerRef.current.id = containerId;
+    const qrContainer = qrContainerRef.current;
+    qrContainer.id = containerId;
 
-    // @ts-ignore
-    if (window.QRLogin) {
+    const qrLogin = authWindow.QRLogin;
+    if (qrLogin) {
       
       
       // 延迟初始化，确保DOM已经准备好
@@ -231,8 +273,11 @@ const AuthPage: React.FC<AuthPageProps> = ({ onGoToSettings }) => {
 
         redirectUri.current = `http://localhost:${port.current}/callback`;
         console.log("redirectUri", redirectUri.current);
-        // @ts-ignore
-        const goto = `https://passport.feishu.cn/suite/passport/oauth/authorize?client_id=${FEISHU_APP_ID}&redirect_uri=${redirectUri.current}&response_type=code&scope=${encodeURIComponent(FEISHU_SCOPE)}&state=STATE`;
+        const goto = buildFeishuAuthorizeUrl({
+          appId: authConfig.appId,
+          redirectUri: redirectUri.current,
+          scope: FEISHU_SCOPE,
+        });
         console.log("goto", goto);
         try {
           // 清理页面中所有可能存在的飞书QR码元素
@@ -264,8 +309,7 @@ const AuthPage: React.FC<AuthPageProps> = ({ onGoToSettings }) => {
           
           console.log('开始初始化飞书QR码...');
           
-          // @ts-ignore
-          const QRLoginObj = window.QRLogin({
+          const QRLoginObj = qrLogin({
             id: containerId,
             goto,
             width: '300',
@@ -276,12 +320,10 @@ const AuthPage: React.FC<AuthPageProps> = ({ onGoToSettings }) => {
           // 飞书文档要求的 message 监听
           const handleMessage = async function (event: MessageEvent) {
             console.log("handleMessage", event, QRLoginObj);
-            // @ts-ignore
             if (QRLoginObj && QRLoginObj.matchOrigin && QRLoginObj.matchData && 
                 QRLoginObj.matchOrigin(event.origin) && QRLoginObj.matchData(event.data)) {
               console.log("handleMessage matched", QRLoginObj, event);
-              // @ts-ignore
-              var loginTmpCode = event.data.tmp_code;
+              const loginTmpCode = (event.data as { tmp_code?: string }).tmp_code;
               const authUrl = `${goto}&tmp_code=${loginTmpCode}`;
               console.log("authUrl", authUrl);
 
@@ -304,8 +346,8 @@ const AuthPage: React.FC<AuthPageProps> = ({ onGoToSettings }) => {
           
           if (typeof window.addEventListener != 'undefined') {
             window.addEventListener('message', handleMessage, false);
-          } else if (typeof (window as any).attachEvent != 'undefined') {
-            (window as any).attachEvent('onmessage', handleMessage);
+          } else if (typeof authWindow.attachEvent != 'undefined') {
+            authWindow.attachEvent('onmessage', handleMessage);
           }
         } catch (error) {
           console.error('初始化飞书QR登录失败:', error);
@@ -322,22 +364,20 @@ const AuthPage: React.FC<AuthPageProps> = ({ onGoToSettings }) => {
       if (messageHandlerRef.current) {
         if (typeof window.removeEventListener != 'undefined') {
           window.removeEventListener('message', messageHandlerRef.current, false);
-        } else if (typeof (window as any).detachEvent != 'undefined') {
-          (window as any).detachEvent('onmessage', messageHandlerRef.current);
+        } else if (typeof authWindow.detachEvent != 'undefined') {
+          authWindow.detachEvent('onmessage', messageHandlerRef.current);
         }
         messageHandlerRef.current = null;
       }
       
       // 清理QR容器内容
-      if (qrContainerRef.current) {
-        qrContainerRef.current.innerHTML = '';
-      }
+      qrContainer.innerHTML = '';
       
       // 重置初始化标记
       qrInitializedRef.current = false;
       globalQRInitialized = false;
     };
-  }, [scriptLoaded]);
+  }, [authConfig, authWindow, message, scriptLoaded]);
 
   return (
     <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh' }}>
@@ -358,6 +398,7 @@ const AuthPage: React.FC<AuthPageProps> = ({ onGoToSettings }) => {
             borderRadius: '6px'
           }}
         >
+          {!authConfig && <span style={{ color: '#999' }}>请先完成飞书应用配置</span>}
           {!scriptLoaded && <span style={{ color: '#999' }}>正在加载二维码...</span>}
         </div>
         
